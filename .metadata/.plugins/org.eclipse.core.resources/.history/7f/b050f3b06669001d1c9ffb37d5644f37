@@ -1,0 +1,725 @@
+/*
+ *												- TASK SCHEDULER -
+ *
+ * > Task Scheduler is implemented for STM32F407G-DISC.
+ * > In this code, the Scheduler is PendSV, and the sysTick handler is used to pend the PendSV exception.
+ * > Tasks implemented (Total five Tasks):
+ * 				1. Idle Task (will run only when all other tasks are blocked)
+ * 				2. Task 1
+ * 				3. Task 2
+ * 				4. Task 3
+ * 				5. Task 4
+ *
+ *
+ * > Each task has its own stack memory (1KB each)
+ * > No task priority
+ * > Scheduling: using sysTick timer to generate exception for every 1ms to run the scheduler code
+ *
+ * 	> I would especially want to thank "FastBit Embedded Brain Academy" on Udemy and instructor Kiran Nayak
+ * 		for helping me learn and understand the development of a task scheduler.
+ * 	> Check out their tutorials: https://www.udemy.com/user/kiran-nayak-2/ *
+ * */
+
+
+
+#include <stdint.h>
+#include <stdio.h>
+
+/* -- TASKS -- */
+void idle_task_handler(void);		// Task 0, Idle Task
+void task1_handler (void);			// Task 1
+void task2_handler (void);			// Task 2
+void task3_handler (void);			// Task 3
+void task4_handler (void);			// Task 4
+
+
+/* -- Number of Tasks -- */
+#define MAX_TASKS 5					// 4 User Tasks + 1 Idle Task
+
+/* -- sysTick initialization -- */
+void init_systick_timer(uint32_t ticks);
+
+/* -- initialization of scheduler stack -- */
+__attribute__ ((naked))void init_scheduler_stack(uint32_t scheduler_topOfStack);
+
+/* -- initialization of Task stack memory with dummy SF1 and SF2 -- */
+void init_task_stack(void);
+
+/* -- Enable faults of the processor in order to trace them when occurred -- */
+void enable_processor_faults(void);
+
+/* -- To switch SP to PSP (Step 6)-- */
+__attribute__ ((naked)) void switch_sp_to_psp(void);
+
+/* -- To get the PSP value of current task -- */
+uint32_t get_psp_value(void);
+
+/* -- To save PSP value -- */
+void save_psp_value(uint32_t current_psp_value);
+
+/* -- To decide next task to run -- */
+void update_next_task(void);
+
+/* -- PendSV handler (Scheduler) -- */
+__attribute__ ((naked)) void PendSV_Handler(void);
+
+/* -- Update Global Tick Count -- */
+void update_global_tick_count(void);
+
+/* -- To unblock a blocked task -- */
+void unblock_task(void);
+
+/* -- sysTick timer handler -- */
+void SysTick_Handler(void);
+
+/* -- To trigger the pendSV -- */
+void schedule(void);
+
+/* -- Task delay function to put task in Blocked state -- */
+void task_Delay(uint32_t tick_count);
+
+
+/* -- STACK CALCULATION INFORMATION (For STM32F407G) -- */
+#define SIZE_TASK_STACK 		1024U
+#define SIZE_SCHEDULER_STACK 	1024U
+
+#define SRAM_START				0x20000000U
+#define SIZE_SRAM				( (128) * (1024) )  				// 128KB
+#define SRAM_END				( (SRAM_START) + (SIZE_SRAM) )
+
+#define TASK1_STACK_START		SRAM_END
+#define TASK2_STACK_START		( (SRAM_END) - (1 * SIZE_TASK_STACK) )
+#define TASK3_STACK_START		( (SRAM_END) - (2 * SIZE_TASK_STACK) )
+#define TASK4_STACK_START		( (SRAM_END) - (3 * SIZE_TASK_STACK) )
+#define IDLE_TASK_STACK_START	( (SRAM_END) - (4 * SIZE_TASK_STACK) )
+#define SCHEDULER_STACK_START 	( (SRAM_END) - (5 * SIZE_TASK_STACK) )
+
+/* -- sysTick timer -- */
+#define TICK_HZ					1000U		// Desired exception frequency
+#define HSI_CLOCK				16000000U	// Clock
+#define SYSTICK_TIMER_CLOCK		HSI_CLOCK
+
+
+
+#define DUMMY_XPSR 				0x01000000U	// To set T bit
+
+/* --  Task States -- */
+#define TASK_READY_STATE		0x00
+#define TASK_BLOCKED_STATE		0xFF
+
+/* -- Disabling and Enabling Interrupts -- */
+// Set 0th bit of PRIMASK Register to disable all the interrupts and clear to enable
+#define DISABLE_INTERRUPTS()	do {__asm volatile ("MOV R0, #0x1"); __asm volatile ("MSR PRIMASK, R0"); } while (0)
+#define ENABLE_INTERRUPTS()		do {__asm volatile ("MOV R0, #0x0"); __asm volatile ("MSR PRIMASK, R0"); } while (0)
+// use case of do while, to write multiple statement in a macro
+
+/*-- 'Current_task' denotes current task running on the CPU -- */
+uint8_t current_task = 1;		// 1 means Task1 is running (Task 0 is Idle Task)
+
+/* -- Global Tick Count -- */
+uint32_t global_tick_count = 0;
+
+/* -- TASK CONTROL BLOCK -- */
+typedef struct
+{
+	uint32_t psp_value;			// PSP of the task
+	uint32_t block_count;		// Delay or wait count
+	uint8_t  current_state; 	// Current State of the task
+	void (*task_handler)(void);	// Function pointer to hold the task handler address
+}TCB_t;
+
+/* -- TCB for Tasks (MAX_TASKS) -- */
+TCB_t user_tasks[MAX_TASKS];	// 1 TCB per task
+
+
+int main(void)
+{
+	/* -- Enable Processor's Faults -- */
+	enable_processor_faults();
+
+
+	/* -- Initialize the scheduler stack i.e. MSP(Main Stack Pointer) -- */
+	init_scheduler_stack(SCHEDULER_STACK_START);
+
+	// Initialization of User Tasks (Done in the beginning of init_task_stack)
+	/* -- Task Stack initialization to store dummy stack frames -- */
+	init_task_stack();
+
+
+	/* -- To generate sysTick timer exception -- */
+	init_systick_timer(TICK_HZ);
+
+	/* -------------------- Up to here, code is using MSP as the stack pointer -------------------- */
+
+	/* -- To switch SP to PSP -- */
+	switch_sp_to_psp();
+
+	/* -- launch First task (before calling task handler, change Stack Pointer) -- */
+	/* -- SP needs to change because task handler runs with PSP as Stack Pointer (switch_sp_to_psp) --  */
+	task1_handler();
+
+
+
+	/* -- Control never reach here as tasks are never returning -- */
+    /* Loop forever */
+	for(;;);
+}
+
+/* -- Task Implementation -- */
+/* -- Tasks are never returning [ while(1) ] -- */
+
+// IDLE TASK
+void idle_task_handler(void)
+{
+	while(1);
+	// Does nothing
+}
+
+void task1_handler (void)
+{
+	while(1)
+	{
+		// Task 1
+	}
+}
+
+void task2_handler (void)
+{
+	while(1)
+	{
+		// Task 2
+	}
+}
+
+void task3_handler (void)
+{
+	while(1)
+	{
+		// Task 3
+	}
+}
+
+void task4_handler (void)
+{
+	while(1)
+	{
+		// Task 4
+	}
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   init_systick_timer
+ * Description	:	Configure and enable the sysTick timer
+ *
+ * Parameter	:	uint32_t ticks : Desired exception frequency
+ * Return Type	:	none (void)
+ * Note			:	-
+ * ------------------------------------------------------------------------------------------------------ */
+void init_systick_timer (uint32_t ticks)
+{
+	/* -- SysTick Reload Value Register (SRVR) -- */
+	uint32_t *pSRVR = (uint32_t*) 0xE000E014;
+
+
+	/* -- SysTick Control and Status Register (SCSR) -- */
+	uint32_t *pSCSR = (uint32_t*) 0xE000E010;;
+
+
+	/* -- Calculate the count value (Reload value - 1) -- */
+	uint32_t count_value = ( SYSTICK_TIMER_CLOCK / ticks ) - 1;   // SYSTICK_TIMER_CLOCK: input clock to sysTick timer
+																  // ticks			  	: desired exception frequency
+
+	/* -- Load the value into SVR -- */
+	*pSRVR &= ~(0x00FFFFFFFF);				// First clear the value of SVR (24 bits in use, rest reserved)
+	*pSRVR |= count_value;					// Load value in to SVR
+
+	/* -- Some settings in SysTick Control and Status Register (SCSR) -- */
+
+	// Three Bits to configure
+	// BIT[2]: CLKSOURCE, BIT[1]: TICKINIT (Enable exception), BIT[0]: ENABLE (Enable the counter)
+
+	*pSCSR |= (1 << 1); 		// BIT[1]: Enable sysTick exception request
+	*pSCSR |= (1 << 2);			// BIT[2]: Clock Source as internal clock (Processor Clock Source)
+
+	/* -- Enable the sysTick -- */
+	*pSCSR |= (1 << 0);			// BIT[0]: Enable the counter (Enable sysTick timer)
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   init_scheduler_stack
+ * Description	:	Initialization of SP (Stack Pointer) for scheduler.
+ *					(SP for scheduler is MSP)
+ * Parameter 1	:	uint32_t scheduler_topOfStack :  Start of scheduler stack
+ * Return Type	:	none (void)
+ * Note			:	making it as an NAKED FUNCTION to prevent prologue sequences
+ * 					AAPCS: ARM Architecture Procedure Call Standard
+ * ------------------------------------------------------------------------------------------------------ */
+__attribute__ ((naked))void init_scheduler_stack(uint32_t scheduler_topOfStack)
+{
+	/* -- Value of MSP should be modified -- */
+
+	// Instruction used is MSR, and 'scheduler_topOfStack' is argument 1 so it is stored in R0 (AAPCS)
+	// 	__asm volatile ("MSR MSP, R0");
+	// OR using in-line assemble syntax including C variable
+	__asm volatile ("MSR MSP, %0" : : "r" (scheduler_topOfStack) : );
+
+	/* Since the naked function doesn't have any prologue or epilogue sequences,
+	 * we have to write our own return statements to go back to the main() function
+	 * (this function is called by main).
+	 */
+
+	// To go back to main() function
+	__asm volatile ("BX LR");
+	/* -- WHY BX LR? BX (Branch indirect) copies the value of LR to PC.
+	 * [BX LR means return from function call] -- */
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   init_task_stack
+ * Description	:	Initialize task stack memory with dummy SF1 and SF2 (Stack Frames)
+ *
+ * Parameters	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:	Initialization of User Tasks is done in the beginning.
+ * 					When the task is scheduled for the first time, it does not have any context. So, a dummy stack frame should be stored in the task's stack area as a part of a task initialization sequence before launching the scheduler.
+					All general purpose registers [R0-R12] can have 0 as a value. But special registers must be set with proper values.
+					LR: a unique value (EXC_RETURN) to control exception exit
+						EXC_RETURN (0xFFFFFFFD) means a return to thread mode. Exception return uses non floating state from the PSP and execution uses PSP after return
+					PC: address of task handler
+					xPSR: T bit must be set to denote thumb state (T bit should never be 0). 0x01000000 for every task
+ * ------------------------------------------------------------------------------------------------------ */
+void init_task_stack(void)
+{
+	// Initially, Keep all the tasks in READY State
+	user_tasks[0].current_state = TASK_READY_STATE;
+	user_tasks[1].current_state = TASK_READY_STATE;
+	user_tasks[2].current_state = TASK_READY_STATE;
+	user_tasks[3].current_state = TASK_READY_STATE;
+	user_tasks[4].current_state = TASK_READY_STATE;
+
+	// Now, initialize the PSP Values
+	user_tasks[0].psp_value = IDLE_TASK_STACK_START;
+	user_tasks[1].psp_value = TASK1_STACK_START;
+	user_tasks[2].psp_value = TASK2_STACK_START;
+	user_tasks[3].psp_value = TASK3_STACK_START;
+	user_tasks[4].psp_value = TASK4_STACK_START;
+
+	// Initialize the task function pointer with task handler address
+	user_tasks[0].task_handler = idle_task_handler;
+	user_tasks[1].task_handler = task1_handler;
+	user_tasks[2].task_handler = task2_handler;
+	user_tasks[3].task_handler = task3_handler;
+	user_tasks[4].task_handler = task4_handler;
+
+	/* -- To store data into stack memory and access it using this pointer -- */
+	uint32_t *pPSP;
+
+	/* -- Initialize User tasks -- */
+	for (int i = 0; i < MAX_TASKS; i++)
+	{
+		// Initialize the pointer with PSP of tasks
+		pPSP = (uint32_t *) user_tasks[i].psp_value;
+
+		// As the Stack is FULL DESCENDING, so, first decrement then value
+		pPSP--;
+		// Now, store the first value: dummy xPSR
+		*pPSP = DUMMY_XPSR;
+
+		// For second value, decrement first and then value
+		pPSP--;
+		// Now, store the second value: PC (return address) [address of the task handler]
+		*pPSP = (uint32_t) user_tasks[i].task_handler;
+
+		// For third value, decrement first and then value
+		pPSP--;
+		// Now, store the third value: LR (EXC_RETURN: 0xFFFFFFFD, execution uses PSP after return)
+		*pPSP = 0xFFFFFFFD;
+
+		// Now, remaining fields are for general purpose registers, their value is ZERO
+		// using loop to store value of 13 general purpose registers [R0 - R12]
+		for (int j = 0; j < 13; j++)
+		{
+			// Same as before, decrement the PSP and then store value
+			pPSP--;
+			// Now, value i.e. 0
+			*pPSP = 0;
+		}
+
+		/* -- Preserve the PSP value (important) -- */
+		user_tasks[i].psp_value = (uint32_t) pPSP;
+
+	}
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   enable_processor_faults
+ * Description	:	To enable the faults exceptions
+ *
+ * Parameters	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:	As code deals with stack memory, there may be a chance of illegal memory manipulation.
+ * 					Also, if there is any fault when changing from thread mode to handler mode or vice versa,
+ * 					it can be tracked by analyzing the fault.
+ * ------------------------------------------------------------------------------------------------------ */
+void enable_processor_faults(void)
+{
+	/* -- System handler control and state register (SHCSR) -- */
+	uint32_t *pSHCSR = (uint32_t *) 0xE000ED24;
+
+	// Enable all configurable exceptions
+	*pSHCSR |= (1 << 16);		// Memory manage fault
+	*pSHCSR |= (1 << 17);		// Bus fault
+	*pSHCSR |= (1 << 18);		// Usage fault
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   get_psp_value
+ * Description	:	To get the PSP value of current task
+ *
+ * Parameters	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+uint32_t get_psp_value(void)
+{
+	// return the PSP value of the current running task on the CPU
+	return user_tasks[current_task].psp_value;
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   save_psp_value
+ * Description	:	To save PSP value
+ *
+ * Parameter 1	:	uint32_t current_psp_value : PSP value of the currently running task
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+void save_psp_value(uint32_t current_psp_value)
+{
+	user_tasks[current_task].psp_value = current_psp_value;
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   update_next_task
+ * Description	:	To decide the next task to run
+ *
+ * Parameter 1	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:	Algorithm opted: Round Robin.
+ * 					If all the tasks are in the blocked state, run the idle task
+ * ------------------------------------------------------------------------------------------------------ */
+void update_next_task(void)
+{
+	int state = TASK_BLOCKED_STATE;
+
+	for (int i = 0; i < MAX_TASKS; i++)		// Go through all the task
+	{
+		// Increment current_task
+		current_task++;
+
+		// This is Round Robin Fashion, [0 becomes 1, 1 becomes 2, 2 becomes 3 and 3 becomes 4 and 4 becomes 0]
+		current_task %= MAX_TASKS;
+
+		// Get current state of the task, if ready, then only schedulable
+		state = user_tasks[current_task].current_state;
+
+		// Also, ignore if IDLE TASK (current_task = 0) because it is always READY
+		if ((state == TASK_READY_STATE) && (current_task != 0))
+		{
+			break;
+		}
+
+	}
+
+	// if all the tasks are in blocked state, run TASK0
+	if (state != TASK_READY_STATE)
+	{
+		current_task = 0;
+	}
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   schedule
+ * Description	:	To trigger the pendSV
+ *
+ * Parameter 1	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+void schedule(void)
+{
+	/* -- Pend the PendSV Exception -- */
+
+	// ICSR = Interrupt Control and State Register (to pend the pendSV)
+	uint32_t *pICSR = (uint32_t *) 0xE000ED04;
+	// Set 28th bit to pend
+	*pICSR |= (1 << 28);
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   task_Delay
+ * Description	:	Task Delay Function
+ *
+ * Parameter 1	:	uint32_t tick_count :
+ * Return Type	:	none (void)
+ * Note			:	Sometimes, the shared global variables can be accessed by both the thread mode code
+ * 					and the handler mode code. Since handler mode codes and thread modes codes are asynchronous,
+ * 					there may be a chance of race conditions.
+					'user-tasks' is shared between thread mode and handler mode,
+					so it is better to disable the interrupts before accessing this global variable
+					and enable it after access.
+					(For this application, it is okay to disable interrupts,
+					but not for other real-world applications)
+ * ------------------------------------------------------------------------------------------------------ */
+/* -- Task Delay Function -- */
+void task_Delay(uint32_t tick_count)
+{
+	// Disable Interrupts
+	// Using PRIMASK Register
+	DISABLE_INTERRUPTS();
+
+	if (current_task)	// Only block the user tasks, not Task0 as it is idle task
+	{
+		/* -- global task_count is maintain by the sysTick and tick_count is sent by the task -- */
+		user_tasks[current_task].block_count = global_tick_count + tick_count;
+		// Taking global_tick_count as a reference
+
+		// Now, change of state
+		user_tasks[current_task].current_state = TASK_BLOCKED_STATE;
+
+		// Allow other tasks to run. HOW? trigger pendSV here
+		schedule();
+	}
+
+	// Enable Interrupts
+	ENABLE_INTERRUPTS();
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   switch_sp_to_psp
+ * Description	:	To switch SP (Stack Pointer) to PSP (Process Stack Pointer)
+ *
+ * Parameter 1	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:	This function has to be a Naked Function because step 2 accesses a special register (CONTROL).
+ * 					MSR instruction is used (in-line assembly)
+ * ------------------------------------------------------------------------------------------------------ */
+__attribute__ ((naked)) void switch_sp_to_psp(void)
+{
+	// To change SP to PSP, use CONTROL Register
+	// Before, changing SP to PSP, initialize PSP
+
+	/* -- (Step 1) Initialize the PSP with Task1 Stack start address (get_psp_value)-- */
+	// WHY Task1? because it is the first task to launch
+
+	// Preserve LR (which connects back to main() : Refer to NOTE )
+	__asm volatile ("PUSH {LR}");
+
+	// Step 1a: Get value of PSP of the current task
+	__asm volatile ("BL get_psp_value"); // Code will branch to get_psp_value function
+										 // BL (Branch with link) is used because we have to come back to switch_sp_to_psp)
+
+	/*-- when step 1a is executed, psp_of_tasks value is stored in R0 (AAPCS) -- */
+	/*-- initial Stack address of current task is stored in R0 -- */
+
+	// Step 1b: Initialize PSP
+	__asm volatile ("MSR PSP, R0");
+
+	// Retrieve LR value : Refer to NOTE
+	__asm volatile ("POP {LR}");
+
+	/* -- NOTE: In Step 1a, because of BL instruction, value of LR will be corrupted because switch_sp_to_psp function
+	 * is called from main() (This LR connects back to the main()), thats why we have to save LR before step 1a),
+	 * and retrieve it back after step 1b.
+	 * -- */
+
+	/* -- (Step 2) Change SP to PSP using CONTROL Register -- */
+
+	// In CONTROL Register, make second bit as 1 to make PSP as current stack pointer
+	// (Step 2a) Save 0x02 as an immediate value (0x02 to set second bit)
+	__asm volatile ("MOV R0, #0x02");
+
+	// (Step 2b) Push the value in CONTROL Register, this will set the second bit as 1
+	__asm volatile ("MSR CONTROL, R0");
+
+	// No epilogue sequence, So manually go back to main()
+	__asm volatile("BX LR");		//BX LR means return from function call
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   PendSV_Handler
+ * Description	:	This is scheduler
+ *
+ * Parameter 1	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+__attribute__ ((naked)) void PendSV_Handler(void)
+{
+	/* -- Step 1: Save the context of current task -- */
+
+		// To do so: Get current running task's PSP value
+		__asm volatile("MRS R0, PSP");
+
+		// Using that PSP value store SF2 (R4-R11) in task's private stack [SF1 is automatically stored (AAPCS)]
+		// Cannot use PUSH instruction as it will corrupt the MSP stack, to simulate PUSH we are using
+		// STMDB instruction (Store Multiple Registers, Decrement  before) [Decrement first then store]
+		__asm volatile ("STMDB R0!, {R4-R11}");	// ! is to update R0 after every store operation
+
+		/* -- Before using BL instruction, save context of LR (So not to corrupt it because of next return address) -- */
+		__asm volatile ("PUSH {LR}"); // LR is going to change because of every BL instruction, we have to save this one
+									  // In order to have proper EXC_RETURN at the time of exit
+
+		// Save the current value of PSP (save R0, because it now has the updated stack address of task's private stack)
+		__asm volatile ("BL save_psp_value");  // When called, R0 will be copied as First Argument(current_psp_value = R0) [AAPCS]
+
+		/* -- Current task's state is saved, Now step 2 -- */
+
+		/* -- Step 2: Retrieve the context of next task -- */
+
+		// To do so: Decide next task to run
+		__asm volatile("BL update_next_task");
+
+		// Get next task's PSP value (its past PSP value)
+		__asm volatile ("BL get_psp_value"); // Since, current task is already updated (previous step),
+											 // next task's PSP will be retrieved (Return value is in R0 [AAPCS])
+
+		// Using that PSP value retrieve SF2 (R4-R11) [SF1 will automatically be retrieved [AAPCS]]
+		// Instruction: Load from stack to register (From memory to register)
+		// Instruction used is LDMIA (Load Multiple Register and Increment After)
+		__asm volatile ("LDMIA R0!, {R4-R11}"); // ! to update R0 after every load operation, save R0 in PSP (next step)
+
+		// Update PSP and exit
+		__asm volatile ("MSR PSP, R0");
+
+		// Exit, during exception return SF1 will be automatically fetched (Exception Return Sequence)
+		// PSP is modified in last step because, Reference for SF1 is the stack address of next updated task
+		// PSP is now pointing to the stack area of the next updated task, So execution will go to next task
+
+		// POP LR
+		__asm volatile ("POP {LR}"); // with proper EXC_RETURN value
+
+		/* -- Since, naked function, no epilogue, so manually return (exception exit) -- */
+		// To exit from an exception: Copy value of EXC_RETURN into PC
+		__asm volatile ("BX LR");
+
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   update_global_tick_count
+ * Description	:	Update Global Tick Count
+ *
+ * Parameters	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+void update_global_tick_count(void)
+{
+	global_tick_count++;
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   unblock_task
+ * Description	:	To unblock a blocked task
+ *
+ * Parameters	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+void unblock_task(void)
+{
+	/* -- Check: if there is any task that can be unblocked
+	 * By comparing the block tick count with the global tick count value -- */
+
+	// Loop is starting from 1 because Task 0 is Idle Task and it is always in READY STATE
+	for (int i = 1; i < MAX_TASKS; i++)
+	{
+		if (user_tasks[i].current_state != TASK_READY_STATE) 	// ONLY to check if task is not in READY STATE
+		{
+			if (user_tasks[i].block_count == global_tick_count)
+			{
+				// Means delay (blocking period) is elapsed, Now change the state
+				user_tasks[i].current_state = TASK_READY_STATE;
+
+			}
+		}
+	}
+}
+
+
+/* ------------------------------------------------------------------------------------------------------
+ * Name			:   SysTick_Handler
+ * Description	:	sysTick timer handler
+ *
+ * Parameters	:	none (void)
+ * Return Type	:	none (void)
+ * Note			:
+ *
+ * ------------------------------------------------------------------------------------------------------ */
+void SysTick_Handler(void)
+{
+	/* -- Update Global Tick Count -- */
+	update_global_tick_count();
+
+	/* -- Unblock a task (if qualify) -- */
+	unblock_task();
+
+	/* -- Pend the PendSV Exception -- */
+	// ICSR = Interrupt Control and State Register (to pend the pendSV)
+	uint32_t *pICSR = (uint32_t *) 0xE000ED04;
+	// Set 28th bit to pend
+	*pICSR |= (1 << 28);
+
+}
+
+
+/* -- Fault Handlers -- */
+void HardFault_Handler(void)
+{
+	printf(" Exception : Hard Fault \n");
+	while(1);
+}
+
+void MemManage_Handler(void)
+{
+	printf(" Exception : Memory Manage Fault \n");
+	while(1);
+}
+
+void BusFault_Handler(void)
+{
+	printf(" Exception : Bus Fault \n");
+	while(1);
+}
+
+void UsageFault_Handler(void)
+{
+	printf(" Exception : Usage Fault \n");
+	while(1);
+}
